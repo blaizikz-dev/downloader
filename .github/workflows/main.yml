@@ -1,20 +1,20 @@
-name: 📦 آپلود پیشرفته فایل به گیت‌هاب
+name: Advanced File Upload to GitHub
 
 on:
   workflow_dispatch:
     inputs:
       file_urls:
-        description: '📎 لینک‌های فایل (هر لینک در یک خط، حداکثر ۱۰ لینک)'
+        description: 'File URLs (one per line, max 10 URLs)'
         required: true
         type: string
         default: ''
       zip_password:
-        description: '🔐 رمز فایل آرشیو (اختیاری)'
+        description: 'Archive password (optional)'
         required: false
         type: string
         default: ''
       split_size:
-        description: '📦 حداکثر حجم هر تکه (مگابایت)'
+        description: 'Maximum chunk size (MB)'
         required: false
         type: choice
         default: '95'
@@ -24,7 +24,7 @@ on:
           - '50'
           - '95'
       compression_level:
-        description: '🗜️ سطح فشرده‌سازی (۰=بدون فشرده‌سازی، ۹=بیشترین فشرده‌سازی)'
+        description: 'Compression level (0=none, 9=ultra)'
         required: false
         type: choice
         default: '3'
@@ -36,50 +36,22 @@ on:
           - '7'
           - '9'
       delete_old_archives:
-        description: '🗑️ حذف تمام آرشیوهای قبلی قبل از آپلود'
+        description: 'Delete all existing archives before upload'
         required: false
         type: boolean
         default: false
-      retry_count:
-        description: '🔄 تعداد دفعات تلاش مجدد برای دانلود هر فایل'
-        required: false
-        type: number
-        default: '3'
-      timeout_seconds:
-        description: '⏱️ زمان انتظار برای دانلود هر فایل (ثانیه)'
-        required: false
-        type: number
-        default: '300'
       custom_prefix:
-        description: '🏷️ پیشوند دلخواه برای فایل‌های خروجی (اختیاری)'
+        description: 'Custom prefix for output files'
         required: false
         type: string
         default: 'file'
-      max_parallel_downloads:
-        description: '⚡ دانلود همزمان (۱ تا ۵ فایل با هم)'
-        required: false
-        type: choice
-        default: '3'
-        options:
-          - '1'
-          - '2'
-          - '3'
-          - '4'
-          - '5'
 
 permissions:
   contents: write
-  actions: read
 
 concurrency:
   group: file-upload-queue
   cancel-in-progress: false
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  PYTHONUNBUFFERED: 1
-  ACTIONS_RUNNER_DEBUG: true
-  ACTIONS_STEP_DEBUG: true
 
 jobs:
   upload-files:
@@ -87,110 +59,72 @@ jobs:
     timeout-minutes: 360
     
     steps:
-      - name: ⚡ دریافت کد مخزن
+      - name: Checkout repository
         uses: actions/checkout@v4
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-        with:
-          fetch-depth: 1
-          sparse-checkout: |
-            downloads
-          sparse-checkout-cone-mode: false
-
-      - name: 🧹 پاکسازی آرشیوهای قدیمی
+        
+      - name: Clean old archives
         if: ${{ github.event.inputs.delete_old_archives == 'true' }}
         run: |
-          echo "🗑️ در حال پاکسازی آرشیوهای قدیمی..."
-          find downloads -type f \( -name "*.7z*" -o -name "*.part*" \) -delete 2>/dev/null || true
-          find . -maxdepth 1 -type f \( -name "*.7z*" -o -name "*.log" \) -delete 2>/dev/null || true
-          echo "✅ پاکسازی انجام شد"
+          echo "Cleaning old archives..."
+          rm -rf downloads/* 2>/dev/null || true
+          echo "Cleanup completed"
 
-      - name: 📝 بررسی و اعتبارسنجی ورودی‌ها
+      - name: Parse and validate inputs
         id: validate
         run: |
-          # دریافت حجم تکه‌ها
-          SIZE="${{ github.event.inputs.split_size }}"
-          echo "split_mb=${SIZE}" >> $GITHUB_OUTPUT
+          echo "split_mb=${{ github.event.inputs.split_size }}" >> $GITHUB_OUTPUT
+          echo "compress=${{ github.event.inputs.compression_level }}" >> $GITHUB_OUTPUT
           
-          # دریافت سطح فشرده‌سازی
-          COMPRESS="${{ github.event.inputs.compression_level }}"
-          echo "compress=${COMPRESS}" >> $GITHUB_OUTPUT
-          
-          # دریافت تعداد تلاش مجدد
-          RETRY="${{ github.event.inputs.retry_count }}"
-          echo "retry=${RETRY:-3}" >> $GITHUB_OUTPUT
-          
-          # دریافت زمان انتظار
-          TIMEOUT="${{ github.event.inputs.timeout_seconds }}"
-          echo "timeout=${TIMEOUT:-300}" >> $GITHUB_OUTPUT
-          
-          # دریافت تعداد دانلود همزمان
-          PARALLEL="${{ github.event.inputs.max_parallel_downloads }}"
-          echo "parallel=${PARALLEL:-3}" >> $GITHUB_OUTPUT
-          
-          # دریافت پیشوند دلخواه
           PREFIX="${{ github.event.inputs.custom_prefix }}"
           if [ -z "$PREFIX" ]; then
             PREFIX="file"
           fi
           echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
           
-          # دریافت لینک‌ها (هر لینک در یک خط)
           echo "${{ github.event.inputs.file_urls }}" | grep -v '^[[:space:]]*$' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > urls.txt
           
-          # اعتبارسنجی لینک‌ها
           total=$(wc -l < urls.txt)
           if [ "$total" -eq 0 ]; then
-            echo "❌ خطا: هیچ لینک معتبری وارد نشده است"
+            echo "Error: No valid URLs provided"
             exit 1
           fi
           
           if [ "$total" -gt 10 ]; then
-            echo "⚠️ هشدار: بیش از ۱۰ لینک وارد شده، فقط ۱۰ لینک اول پردازش می‌شوند"
             head -10 urls.txt > urls_temp.txt
             mv urls_temp.txt urls.txt
             total=10
           fi
           
           echo "url_count=${total}" >> $GITHUB_OUTPUT
-          echo "📊 تعداد لینک‌ها: ${total}"
-          echo "📋 لینک‌های مورد نظر:"
-          cat -n urls.txt
+          echo "URL count: ${total}"
+          cat urls.txt
 
-      - name: 🛠️ نصب ابزارهای مورد نیاز
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y p7zip-full curl wget aria2 jq pigz
-          echo "✅ ابزارهای مورد نیاز نصب شدند"
+          sudo apt-get install -y p7zip-full curl wget
 
-      - name: 📥 دانلود فایل‌ها (حالت همزمان)
+      - name: Download files
         id: download
-        timeout-minutes: 60
         run: |
           mkdir -p downloads/temp
           cd downloads/temp
           
-          PARALLEL="${{ steps.validate.outputs.parallel }}"
-          RETRY="${{ steps.validate.outputs.retry }}"
-          TIMEOUT="${{ steps.validate.outputs.timeout }}"
           PREFIX="${{ steps.validate.outputs.prefix }}"
           TOTAL_URLS="${{ steps.validate.outputs.url_count }}"
           
-          # ایجاد اسکریپت دانلود
-          cat > download.sh << 'SCRIPT'
+          cat > download_single.sh << 'EOF'
           #!/bin/bash
           URL="$1"
           COUNTER="$2"
           TOTAL="$3"
           PREFIX="$4"
           
-          # استخراج نام فایل از لینک
           FILENAME=$(basename "$URL" | cut -d'?' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
           if [ -z "$FILENAME" ]; then
             FILENAME="file_${COUNTER}"
           fi
           
-          # ساخت نام خروجی
           if [ "$TOTAL" -gt 1 ]; then
             NUM=$(printf '%02d' $COUNTER)
             OUTPUT_NAME="${PREFIX}_${NUM}_${FILENAME}"
@@ -198,7 +132,6 @@ jobs:
             OUTPUT_NAME="${PREFIX}_${FILENAME}"
           fi
           
-          # محدود کردن طول نام فایل
           if [ ${#OUTPUT_NAME} -gt 100 ]; then
             EXT="${OUTPUT_NAME##*.}"
             BASE="${OUTPUT_NAME%.*}"
@@ -206,61 +139,52 @@ jobs:
             OUTPUT_NAME="${BASE}.${EXT}"
           fi
           
-          echo "📥 [$COUNTER/$TOTAL] در حال دانلود: $OUTPUT_NAME"
+          echo "[$COUNTER/$TOTAL] Downloading: $OUTPUT_NAME"
           
-          # تلاش با روش‌های مختلف دانلود
-          if curl -L --fail --retry $RETRY --retry-delay 5 --connect-timeout 30 \
-             --max-time $TIMEOUT --progress-bar -o "$OUTPUT_NAME" "$URL" 2>/dev/null; then
+          if curl -L --fail --retry 3 --retry-delay 5 --connect-timeout 30 \
+             --max-time 300 --progress-bar -o "$OUTPUT_NAME" "$URL" 2>&1; then
             SIZE=$(du -h "$OUTPUT_NAME" | cut -f1)
-            echo "✅ دانلود شد: $OUTPUT_NAME ($SIZE)"
+            echo "SUCCESS: $OUTPUT_NAME ($SIZE)"
             echo "$OUTPUT_NAME" >> ../downloaded.txt
-            return 0
-          elif wget --tries=$RETRY --timeout=$TIMEOUT -q --show-progress -O "$OUTPUT_NAME" "$URL" 2>/dev/null; then
+            exit 0
+          elif wget --tries=3 --timeout=300 -q -O "$OUTPUT_NAME" "$URL" 2>&1; then
             SIZE=$(du -h "$OUTPUT_NAME" | cut -f1)
-            echo "✅ دانلود شد: $OUTPUT_NAME ($SIZE)"
+            echo "SUCCESS: $OUTPUT_NAME ($SIZE)"
             echo "$OUTPUT_NAME" >> ../downloaded.txt
-            return 0
+            exit 0
           else
-            echo "❌ دانلود ناموفق: $URL"
-            return 1
+            echo "FAILED: $URL"
+            exit 1
           fi
-          SCRIPT
+          EOF
           
-          chmod +x download.sh
+          chmod +x download_single.sh
           
-          # پردازش دانلودها به صورت همزمان
           COUNTER=1
           SUCCESS=0
           FAILED=0
           
           while IFS= read -r url; do
             if [ -n "$url" ]; then
-              export -f download
-              timeout 600 bash download.sh "$url" "$COUNTER" "$TOTAL_URLS" "$PREFIX" &
-              
-              # کنترل تعداد دانلودهای همزمان
-              while [ $(jobs -r | wc -l) -ge $PARALLEL ]; do
-                sleep 1
-              done
-              
+              if bash download_single.sh "$url" "$COUNTER" "$TOTAL_URLS" "$PREFIX"; then
+                SUCCESS=$((SUCCESS + 1))
+              else
+                FAILED=$((FAILED + 1))
+              fi
               COUNTER=$((COUNTER + 1))
             fi
           done < ../../urls.txt
           
-          # منتظر ماندن برای اتمام همه دانلودها
-          wait
-          
-          # شمارش نتایج
-          if [ -f downloaded.txt ]; then
-            SUCCESS=$(wc -l < downloaded.txt)
-          fi
-          
-          FAILED=$((COUNTER - 1 - SUCCESS))
           echo "success_count=${SUCCESS}" >> $GITHUB_OUTPUT
           echo "failed_count=${FAILED}" >> $GITHUB_OUTPUT
-          echo "📊 آمار دانلود: موفق: $SUCCESS، ناموفق: $FAILED"
+          echo "Download stats - Success: $SUCCESS, Failed: $FAILED"
+          
+          if [ "$SUCCESS" -eq 0 ]; then
+            echo "No files downloaded successfully"
+            exit 1
+          fi
 
-      - name: 🗜️ فشرده‌سازی و تقسیم فایل‌ها
+      - name: Archive and split files
         id: archive
         run: |
           SPLIT_MB="${{ steps.validate.outputs.split_mb }}"
@@ -270,151 +194,76 @@ jobs:
           FOLDER="downloads/${TIMESTAMP}"
           mkdir -p "$FOLDER"
           
-          echo "📁 پوشه خروجی: ${FOLDER}"
-          echo "📦 حجم هر تکه: ${SPLIT_MB} مگابایت"
-          echo "🗜️ سطح فشرده‌سازی: ${COMPRESS}"
+          echo "Output folder: ${FOLDER}"
+          echo "Split size: ${SPLIT_MB}MB"
+          echo "Compression level: ${COMPRESS}"
           
           PROCESSED=0
-          TOTAL_SIZE=0
-          
           cd downloads/temp
           
           for file in *; do
-            [ -f "$file" ] || continue
-            PROCESSED=$((PROCESSED + 1))
-            SIZE=$(stat -c%s "$file")
-            TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
-            
-            echo "🔄 در حال پردازش: $file ($(numfmt --to=iec $SIZE))"
-            
-            # ساخت دستور 7z
-            7Z_CMD="7z a"
-            
-            if [ -n "$PASSWORD" ] && [ ${#PASSWORD} -gt 0 ]; then
-              7Z_CMD="$7Z_CMD -p\"$PASSWORD\" -mhe=on"
-            fi
-            
-            7Z_CMD="$7Z_CMD -mx=${COMPRESS} -mmt=on"
-            
-            # تقسیم اگر فایل بزرگتر از حجم تعیین شده است
-            FILE_SIZE_MB=$((SIZE / 1024 / 1024))
-            if [ $FILE_SIZE_MB -gt $SPLIT_MB ] || [ $PROCESSED -gt 1 ]; then
-              7Z_CMD="$7Z_CMD -v${SPLIT_MB}m"
-            fi
-            
-            7Z_CMD="$7Z_CMD \"../${FOLDER}/${file}.7z\" \"$file\""
-            
-            eval $7Z_CMD > /dev/null 2>&1
-            
-            # بررسی اینکه آیا فایل به چند تکه تقسیم شده
-            if [ -f "../${FOLDER}/${file}.7z.001" ]; then
-              # بررسی اینکه فقط یک تکه وجود دارد
-              if [ ! -f "../${FOLDER}/${file}.7z.002" ]; then
-                mv "../${FOLDER}/${file}.7z.001" "../${FOLDER}/${file}.7z"
-                echo "  ✅ آرشیو تک فایلی"
+            if [ -f "$file" ]; then
+              PROCESSED=$((PROCESSED + 1))
+              SIZE=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file")
+              echo "Processing: $file"
+              
+              if [ -n "$PASSWORD" ] && [ ${#PASSWORD} -gt 0 ]; then
+                7z a -p"$PASSWORD" -mhe=on -mx=${COMPRESS} -v${SPLIT_MB}m "../${FOLDER}/${file}.7z" "$file" > /dev/null 2>&1
               else
-                echo "  ✅ تقسیم به چند تکه"
+                7z a -mx=${COMPRESS} -v${SPLIT_MB}m "../${FOLDER}/${file}.7z" "$file" > /dev/null 2>&1
               fi
-            else
-              echo "  ✅ آرشیو با موفقیت انجام شد"
+              
+              if [ -f "../${FOLDER}/${file}.7z.001" ]; then
+                if [ ! -f "../${FOLDER}/${file}.7z.002" ]; then
+                  mv "../${FOLDER}/${file}.7z.001" "../${FOLDER}/${file}.7z"
+                fi
+              fi
             fi
           done
           
           cd ../..
-          
-          # محاسبه حجم کل
-          TOTAL_SIZE_HR=$(du -sh "$FOLDER" | cut -f1)
+          TOTAL_SIZE=$(du -sh "$FOLDER" | cut -f1)
           echo "processed_count=${PROCESSED}" >> $GITHUB_OUTPUT
           echo "folder=${FOLDER}" >> $GITHUB_OUTPUT
-          echo "total_size=${TOTAL_SIZE_HR}" >> $GITHUB_OUTPUT
+          echo "total_size=${TOTAL_SIZE}" >> $GITHUB_OUTPUT
           
-          # پاکسازی فایل‌های موقت
           rm -rf downloads/temp
-          
-          echo "📊 تعداد فایل‌های پردازش شده: ${PROCESSED}، حجم کل: ${TOTAL_SIZE_HR}"
+          echo "Processed ${PROCESSED} files, total size: ${TOTAL_SIZE}"
 
-      - name: 📊 ایجاد فایل راهنما
-        id: manifest
-        run: |
-          FOLDER="${{ steps.archive.outputs.folder }}"
-          MANIFEST="${FOLDER}/راهنما.txt"
-          
-          echo "=========================================" > "$MANIFEST"
-          echo "راهنمای فایل‌های آپلود شده" >> "$MANIFEST"
-          echo "تاریخ: $(date)" >> "$MANIFEST"
-          echo "مخزن: ${{ github.repository }}" >> "$MANIFEST"
-          echo "=========================================" >> "$MANIFEST"
-          echo "" >> "$MANIFEST"
-          
-          if [ -n "${{ github.event.inputs.zip_password }}" ]; then
-            echo "🔐 رمز فایل آرشیو: ${{ github.event.inputs.zip_password }}" >> "$MANIFEST"
-            echo "" >> "$MANIFEST"
-          fi
-          
-          echo "📦 لیست فایل‌های آپلود شده:" >> "$MANIFEST"
-          echo "" >> "$MANIFEST"
-          
-          cd "$FOLDER"
-          for file in *.7z*; do
-            if [ -f "$file" ]; then
-              SIZE=$(du -h "$file" | cut -f1)
-              echo "- $file (حجم: $SIZE)" >> راهنما.txt
-            fi
-          done
-          cd ../..
-          
-          echo "✅ فایل راهنما ایجاد شد: $MANIFEST"
-          
-          # اضافه کردن فایل راهنما به گیت
-          git add "$MANIFEST" 2>/dev/null || true
-
-      - name: 🔧 تنظیمات گیت
+      - name: Configure Git
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
 
-      - name: 🚀 ارسال به مخزن با قابلیت تکرار
+      - name: Commit and push
         run: |
           FOLDER="${{ steps.archive.outputs.folder }}"
           
-          # اضافه کردن همه فایل‌های جدید
           git add "${FOLDER}/"* 2>/dev/null || true
           
           if git diff --staged --quiet; then
-            echo "ℹ️ فایل جدیدی برای ارسال وجود ندارد"
+            echo "No files to commit"
             exit 0
           fi
           
           CHUNK_COUNT=$(git diff --staged --name-only | wc -l)
-          git commit -m "📦 آپلود: ${{ steps.archive.outputs.processed_count }} فایل در پوشه ${FOLDER} (${CHUNK_COUNT} تکه)"
+          git commit -m "Upload: ${{ steps.archive.outputs.processed_count }} file(s) to ${FOLDER} (${CHUNK_COUNT} chunks)"
           
-          # ارسال با قابلیت تکرار خودکار
-          MAX_RETRIES=10
-          RETRY_DELAY=15
-          
+          MAX_RETRIES=5
           for attempt in $(seq 1 $MAX_RETRIES); do
-            echo "🔄 تلاش $attempt از $MAX_RETRIES برای ارسال..."
-            
-            # دریافت آخرین تغییرات برای جلوگیری از تداخل
+            echo "Push attempt $attempt/$MAX_RETRIES..."
             git pull --rebase origin main 2>/dev/null || true
-            
             if git push origin main; then
-              echo "✅ ارسال با موفقیت انجام شد!"
+              echo "Push successful"
               exit 0
-            else
-              if [ $attempt -lt $MAX_RETRIES ]; then
-                echo "⚠️ ارسال ناموفق بود، تلاش مجدد در ${RETRY_DELAY} ثانیه..."
-                sleep $RETRY_DELAY
-                RETRY_DELAY=$((RETRY_DELAY * 2))
-              fi
             fi
+            sleep 10
           done
           
-          echo "❌ ارسال پس از $MAX_RETRIES تلاش ناموفق بود"
+          echo "Push failed after $MAX_RETRIES attempts"
           exit 1
 
-      - name: ✅ گزارش نهایی
+      - name: Summary
         if: always()
         run: |
           SUCCESS_DL="${{ steps.download.outputs.success_count }}"
@@ -423,46 +272,13 @@ jobs:
           TOTAL_SIZE="${{ steps.archive.outputs.total_size }}"
           FOLDER="${{ steps.archive.outputs.folder }}"
           SPLIT_SIZE="${{ steps.validate.outputs.split_mb }}"
-          COMPRESS="${{ steps.validate.outputs.compress }}"
-          PASSWORD_SET="${{ github.event.inputs.zip_password != '' }}"
           
-          # تعیین وضعیت کلی
-          if [ "$SUCCESS_DL" -gt 0 ] && [ "$FAILED_DL" -eq 0 ] && [ "$PROCESSED" -gt 0 ]; then
-            STATUS="✅ **موفق**"
-            COLOR="success"
-          elif [ "$SUCCESS_DL" -gt 0 ]; then
-            STATUS="⚠️ **نسبتاً موفق** (بعضی دانلودها ناموفق بودند)"
-            COLOR="warning"
-          else
-            STATUS="❌ **ناموفق**"
-            COLOR="failure"
-          fi
-          
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          <div dir="rtl" align="right">
-          
-          ## 📦 گزارش آپلود فایل
-          
-          | مورد | مقدار |
-          |------|-------|
-          | وضعیت | STATUS_PLACEHOLDER |
-          | دانلود موفق | SUCCESS_DL_PLACEHOLDER / TOTAL_PLACEHOLDER |
-          | فایل پردازش شده | PROCESSED_PLACEHOLDER عدد |
-          | حجم کل فایل‌ها | TOTAL_SIZE_PLACEHOLDER |
-          | حجم هر تکه | SPLIT_SIZE_PLACEHOLDER مگابایت |
-          | سطح فشرده‌سازی | COMPRESS_PLACEHOLDER از ۹ |
-          | رمزگذاری | PASSWORD_PLACEHOLDER |
-          | پوشه خروجی | [FOLDER_PLACEHOLDER](https://github.com/${{ github.repository }}/tree/main/FOLDER_PLACEHOLDER) |
-          
-          </div>
-          
-          <details>
-          <summary><b>📖 راهنمای دانلود و استخراج فایل‌ها</b></summary>
-          
-          ### 🔽 روش دانلود فایل:
-          ```bash
-          # دانلود یک فایل خاص
-          wget https://github.com/${{ github.repository }}/raw/main/FOLDER_PLACEHOLDER/نام_فایل.7z
-          
-          # یا استفاده از curl
-          curl -L -O https://github.com/${{ github.repository }}/raw/main/FOLDER_PLACEHOLDER/نام_فایل.7z
+          echo "## Upload Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Download Status | ✅ $SUCCESS_DL success / ❌ $FAILED_DL failed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Files Processed | $PROCESSED |" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Size | ${TOTAL_SIZE:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Chunk Size | $SPLIT_SIZE MB |" >> $GITHUB_STEP_SUMMARY
+          echo "| Output Folder | [${FOLDER}](https://github.com/${{ github.repository }}/tree/main/${FOLDER}) |" >> $GITHUB_STEP_SUMMARY

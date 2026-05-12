@@ -51,10 +51,10 @@ on:
         type: number
         default: '300'
       custom_prefix:
-        description: '🏷️ پیشوند دلخواه برای فایل‌های خروجی (پیش‌فرض: sci-hub.ir)'
+        description: '🏷️ پیشوند دلخواه برای فایل‌های خروجی (اختیاری)'
         required: false
         type: string
-        default: 'sci-hub.ir'
+        default: 'file'
       max_parallel_downloads:
         description: '⚡ دانلود همزمان (۱ تا ۵ فایل با هم)'
         required: false
@@ -126,7 +126,7 @@ jobs:
           # دریافت پیشوند دلخواه
           PREFIX="${{ github.event.inputs.custom_prefix }}"
           if [ -z "$PREFIX" ]; then
-            PREFIX="sci-hub.ir"
+            PREFIX="file"
           fi
           echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
           

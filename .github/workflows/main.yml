@@ -1,289 +1,236 @@
-name: Advanced File Upload to GitHub
+name: AVASAM File Uploader
 
 on:
   workflow_dispatch:
     inputs:
-      file_urls:
-        description: 'File URLs (one per line, max 10 URLs)'
+      urls:
+        description: 'Download URLs (space separated for multiple files)'
         required: true
         type: string
         default: ''
-      zip_password:
-        description: 'Archive password (optional)'
+      password:
+        description: 'Zip password (optional)'
         required: false
         type: string
         default: ''
-      split_size:
-        description: 'Maximum chunk size (MB)'
-        required: false
-        type: choice
-        default: '95'
-        options:
-          - '10'
-          - '25'
-          - '50'
-          - '95'
-      compression_level:
-        description: 'Compression level (0=none, 9=ultra)'
-        required: false
-        type: choice
-        default: '3'
-        options:
-          - '0'
-          - '1'
-          - '3'
-          - '5'
-          - '7'
-          - '9'
-      delete_old_archives:
-        description: 'Delete all existing archives before upload'
-        required: false
-        type: boolean
-        default: false
-      custom_prefix:
-        description: 'Custom prefix for output files'
-        required: false
-        type: string
-        default: 'file'
 
 permissions:
   contents: write
 
-concurrency:
-  group: file-upload-queue
-  cancel-in-progress: false
-
 jobs:
-  upload-files:
+  download-and-upload:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     
     steps:
+      - name: Check URL provided
+        run: |
+          if [ -z "${{ github.event.inputs.urls }}" ]; then
+            echo ""
+            echo "❌ No download link entered!"
+            echo ""
+            echo "📌 Guide:"
+            echo "   1️⃣ Run the workflow again"
+            echo "   2️⃣ Enter the file URL in the 'urls' field"
+            echo "   3️⃣ For multiple files, separate URLs with space"
+            echo ""
+            exit 1
+          fi
+          echo "✅ URL received: ${{ github.event.inputs.urls }}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-          ref: main
-          
-      - name: Clean old archives
-        if: ${{ github.event.inputs.delete_old_archives == 'true' }}
-        run: |
-          echo "Cleaning old archives..."
-          rm -rf downloads/* 2>/dev/null || true
-          git rm -rf downloads/ 2>/dev/null || true
-          echo "Cleanup completed"
 
-      - name: Parse and validate inputs
-        id: validate
+      - name: Configure Git for large files
         run: |
-          echo "split_mb=${{ github.event.inputs.split_size }}" >> $GITHUB_OUTPUT
-          echo "compress=${{ github.event.inputs.compression_level }}" >> $GITHUB_OUTPUT
-          
-          PREFIX="${{ github.event.inputs.custom_prefix }}"
-          if [ -z "$PREFIX" ]; then
-            PREFIX="file"
-          fi
-          echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
-          
-          echo "${{ github.event.inputs.file_urls }}" | grep -v '^[[:space:]]*$' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > urls.txt
-          
-          total=$(wc -l < urls.txt)
-          if [ "$total" -eq 0 ]; then
-            echo "Error: No valid URLs provided"
-            exit 1
-          fi
-          
-          if [ "$total" -gt 10 ]; then
-            head -10 urls.txt > urls_temp.txt
-            mv urls_temp.txt urls.txt
-            total=10
-          fi
-          
-          echo "url_count=${total}" >> $GITHUB_OUTPUT
-          echo "URL count: ${total}"
-          cat urls.txt
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git config --global http.postBuffer 524288000
+          echo "Git configured"
 
       - name: Install dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y p7zip-full curl wget
+          sudo apt-get update
+          sudo apt-get install -y curl wget zip unzip bc
+          echo "Dependencies installed"
 
       - name: Download files
         id: download
         run: |
-          mkdir -p downloads/temp
-          cd downloads/temp
+          URLS="${{ github.event.inputs.urls }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
           
-          PREFIX="${{ steps.validate.outputs.prefix }}"
-          TOTAL_URLS="${{ steps.validate.outputs.url_count }}"
+          # Create directories
+          mkdir -p downloads temp_downloads
           
-          cat > download_single.sh << 'EOF'
-          #!/bin/bash
-          URL="$1"
-          COUNTER="$2"
-          TOTAL="$3"
-          PREFIX="$4"
+          echo "Starting download process..."
+          echo "URLs to download: $URLS"
           
-          FILENAME=$(basename "$URL" | cut -d'?' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
-          if [ -z "$FILENAME" ]; then
-            FILENAME="file_${COUNTER}"
-          fi
+          SUCCESS_COUNT=0
+          FAILED_COUNT=0
+          FILE_LIST=""
           
-          if [ "$TOTAL" -gt 1 ]; then
-            NUM=$(printf '%02d' $COUNTER)
-            OUTPUT_NAME="${PREFIX}_${NUM}_${FILENAME}"
-          else
-            OUTPUT_NAME="${PREFIX}_${FILENAME}"
-          fi
-          
-          if [ ${#OUTPUT_NAME} -gt 100 ]; then
-            EXT="${OUTPUT_NAME##*.}"
-            BASE="${OUTPUT_NAME%.*}"
-            BASE="${BASE:0:80}"
-            OUTPUT_NAME="${BASE}.${EXT}"
-          fi
-          
-          echo "[$COUNTER/$TOTAL] Downloading: $OUTPUT_NAME"
-          
-          if curl -L --fail --retry 3 --retry-delay 5 --connect-timeout 30 \
-             --max-time 300 --progress-bar -o "$OUTPUT_NAME" "$URL" 2>&1; then
-            SIZE=$(du -h "$OUTPUT_NAME" | cut -f1)
-            echo "SUCCESS: $OUTPUT_NAME ($SIZE)"
-            echo "$OUTPUT_NAME" >> ../downloaded.txt
-            exit 0
-          elif wget --tries=3 --timeout=300 -q -O "$OUTPUT_NAME" "$URL" 2>&1; then
-            SIZE=$(du -h "$OUTPUT_NAME" | cut -f1)
-            echo "SUCCESS: $OUTPUT_NAME ($SIZE)"
-            echo "$OUTPUT_NAME" >> ../downloaded.txt
-            exit 0
-          else
-            echo "FAILED: $URL"
-            exit 1
-          fi
-          EOF
-          
-          chmod +x download_single.sh
-          
-          COUNTER=1
-          SUCCESS=0
-          FAILED=0
-          
-          while IFS= read -r url; do
-            if [ -n "$url" ]; then
-              if bash download_single.sh "$url" "$COUNTER" "$TOTAL_URLS" "$PREFIX"; then
-                SUCCESS=$((SUCCESS + 1))
-              else
-                FAILED=$((FAILED + 1))
-              fi
-              COUNTER=$((COUNTER + 1))
+          # Download each URL
+          for URL in $URLS; do
+            # Extract filename from URL
+            FILENAME=$(basename "$URL" | sed 's/?.*//' | sed 's/[^a-zA-Z0-9._-]/_/g')
+            if [ -z "$FILENAME" ]; then
+              FILENAME="file_$(date +%s)_$((RANDOM % 1000))"
             fi
-          done < ../../urls.txt
+            
+            echo ""
+            echo "Downloading: $URL"
+            echo "Saving as: $FILENAME"
+            
+            # Try downloading with curl
+            if curl -L -f --retry 3 --retry-delay 5 --connect-timeout 30 \
+               --max-time 600 --progress-bar -o "temp_downloads/$FILENAME" "$URL"; then
+              
+              if [ -f "temp_downloads/$FILENAME" ] && [ -s "temp_downloads/$FILENAME" ]; then
+                SIZE=$(du -h "temp_downloads/$FILENAME" | cut -f1)
+                echo "✅ Successfully downloaded: $FILENAME ($SIZE)"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                FILE_LIST="$FILE_LIST $FILENAME"
+              else
+                echo "❌ Downloaded file is empty: $FILENAME"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+              fi
+            else
+              echo "❌ Failed to download: $URL"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+          done
           
-          echo "success_count=${SUCCESS}" >> $GITHUB_OUTPUT
-          echo "failed_count=${FAILED}" >> $GITHUB_OUTPUT
-          echo "Download stats - Success: $SUCCESS, Failed: $FAILED"
+          echo ""
+          echo "=========================================="
+          echo "Download Summary:"
+          echo "✅ Success: $SUCCESS_COUNT"
+          echo "❌ Failed: $FAILED_COUNT"
+          echo "=========================================="
           
-          if [ "$SUCCESS" -eq 0 ]; then
+          # Save counts for summary
+          echo "success_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+          
+          if [ $SUCCESS_COUNT -eq 0 ]; then
             echo "No files downloaded successfully"
             exit 1
           fi
 
-      - name: Archive and split files
-        id: archive
+      - name: Create zip archives
         run: |
-          SPLIT_MB="${{ steps.validate.outputs.split_mb }}"
-          COMPRESS="${{ steps.validate.outputs.compress }}"
-          PASSWORD="${{ github.event.inputs.zip_password }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          FOLDER="downloads/${TIMESTAMP}"
-          mkdir -p "$FOLDER"
+          MAIN_FOLDER="downloads/${TIMESTAMP}"
+          mkdir -p "$MAIN_FOLDER"
           
-          echo "Output folder: ${FOLDER}"
-          echo "Split size: ${SPLIT_MB}MB"
-          echo "Compression level: ${COMPRESS}"
+          echo "Creating archives in: $MAIN_FOLDER"
           
-          PROCESSED=0
-          cd downloads/temp
-          
-          for file in *; do
-            if [ -f "$file" ]; then
-              PROCESSED=$((PROCESSED + 1))
-              echo "Processing: $file"
+          # Process each downloaded file
+          for FILE in temp_downloads/*; do
+            if [ -f "$FILE" ]; then
+              BASENAME=$(basename "$FILE")
+              BASENAME_NO_EXT="${BASENAME%.*}"
               
-              if [ -n "$PASSWORD" ] && [ ${#PASSWORD} -gt 0 ]; then
-                7z a -p"$PASSWORD" -mhe=on -mx=${COMPRESS} -v${SPLIT_MB}m "../${FOLDER}/${file}.7z" "$file" > /dev/null 2>&1
+              # Create folder for each file
+              FILE_FOLDER="$MAIN_FOLDER/${BASENAME_NO_EXT}"
+              mkdir -p "$FILE_FOLDER"
+              
+              # Get file size
+              SIZE=$(stat -c%s "$FILE")
+              SIZE_MB=$((SIZE / 1024 / 1024))
+              
+              echo "Processing: $BASENAME (${SIZE_MB}MB)"
+              
+              # Create zip archive
+              if [ -n "$ZIP_PASSWORD" ]; then
+                # Create password-protected zip
+                zip -j -P "$ZIP_PASSWORD" "$FILE_FOLDER/${BASENAME_NO_EXT}.zip" "$FILE"
               else
-                7z a -mx=${COMPRESS} -v${SPLIT_MB}m "../${FOLDER}/${file}.7z" "$file" > /dev/null 2>&1
+                # Create regular zip
+                zip -j "$FILE_FOLDER/${BASENAME_NO_EXT}.zip" "$FILE"
               fi
               
-              if [ -f "../${FOLDER}/${file}.7z.001" ]; then
-                if [ ! -f "../${FOLDER}/${file}.7z.002" ]; then
-                  mv "../${FOLDER}/${file}.7z.001" "../${FOLDER}/${file}.7z"
-                fi
+              # Check if zip was created
+              if [ -f "$FILE_FOLDER/${BASENAME_NO_EXT}.zip" ]; then
+                ZIP_SIZE=$(du -h "$FILE_FOLDER/${BASENAME_NO_EXT}.zip" | cut -f1)
+                echo "  ✅ Created: ${BASENAME_NO_EXT}.zip ($ZIP_SIZE)"
+                
+                # Create README for this file
+                cat > "$FILE_FOLDER/README.md" << EOF
+# ${BASENAME_NO_EXT}
+
+**Original file:** \`$BASENAME\`  
+**Size:** ${SIZE_MB} MB  
+**Archive:** \`${BASENAME_NO_EXT}.zip\`
+
+## Download
+- [Click here to download](${BASENAME_NO_EXT}.zip)
+
+## Extract
+\`\`\`bash
+# Without password
+unzip ${BASENAME_NO_EXT}.zip
+
+# With password (if set)
+unzip -P "password" ${BASENAME_NO_EXT}.zip
+\`\`\`
+
+---
+*Uploaded by AVASAM Downloader - https://avasam.ir*
+EOF
+              else
+                echo "  ❌ Failed to create zip for $BASENAME"
               fi
             fi
           done
           
-          cd ../..
-          TOTAL_SIZE=$(du -sh "$FOLDER" | cut -f1)
-          echo "processed_count=${PROCESSED}" >> $GITHUB_OUTPUT
-          echo "folder=${FOLDER}" >> $GITHUB_OUTPUT
-          echo "total_size=${TOTAL_SIZE}" >> $GITHUB_OUTPUT
+          # Clean up temp files
+          rm -rf temp_downloads
           
-          rm -rf downloads/temp
-          echo "Processed ${PROCESSED} files, total size: ${TOTAL_SIZE}"
+          echo "FOLDER_NAME=${TIMESTAMP}" >> $GITHUB_OUTPUT
 
-      - name: Create README for the folder
+      - name: Create main README
         run: |
-          FOLDER="${{ steps.archive.outputs.folder }}"
-          cat > "$FOLDER/README.md" << EOF
-          # Files uploaded on $(date)
+          TIMESTAMP="${{ steps.download.folder_name }}"
+          REPO_URL="https://github.com/${{ github.repository }}"
           
-          ## Download Instructions
+          cat > downloads/README.md << EOF
+# Downloaded Files
+
+This directory contains files downloaded on $(date '+%Y-%m-%d %H:%M:%S UTC')
+
+## Available Downloads
+
+EOF
           
-          ### To download a single file:
-          \`\`\`bash
-          wget https://github.com/${{ github.repository }}/raw/main/${FOLDER}/filename.7z
-          \`\`\`
-          
-          ### To extract:
-          \`\`\`bash
-          # Without password
-          7z x filename.7z
-          
-          # With password (if set)
-          7z x -p"your_password" filename.7z
-          
-          # For multi-part files
-          7z x filename.7z.001
-          \`\`\`
-          
-          ## Files in this upload:
-          EOF
-          
-          cd "$FOLDER"
-          for file in *.7z*; do
-            if [ -f "$file" ]; then
-              SIZE=$(du -h "$file" | cut -f1)
-              echo "- \`$file\` ($SIZE)" >> README.md
+          # List all folders
+          for folder in downloads/*/; do
+            if [ -d "$folder" ] && [ -f "$folder/README.md" ]; then
+              FOLDER_NAME=$(basename "$folder")
+              echo "- [${FOLDER_NAME}](${FOLDER_NAME}/)" >> downloads/README.md
             fi
           done
-          cd ../..
           
-          echo "README created in $FOLDER"
+          cat >> downloads/README.md << EOF
 
-      - name: Configure Git
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+---
+*AVASAM Downloader - https://avasam.ir*
+EOF
+          
+          echo "Main README created"
 
-      - name: Commit and push with force
+      - name: Push to repository
         run: |
           # Pull latest changes
           git pull origin main --rebase || true
           
           # Add all downloads
           git add downloads/
+          git add README.md 2>/dev/null || true
           
           # Check if there are changes
           if git diff --staged --quiet; then
@@ -292,55 +239,54 @@ jobs:
           fi
           
           # Commit
-          FOLDER="${{ steps.archive.outputs.folder }}"
-          git commit -m "Upload files to ${FOLDER}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          git commit -m "AVASAM: Add downloaded files ($TIMESTAMP)"
           
-          # Push with multiple retries
+          # Push with retry
           for i in 1 2 3 4 5; do
             echo "Push attempt $i..."
             if git push origin main; then
-              echo "Push successful!"
+              echo "✅ Push successful!"
               exit 0
             fi
             git pull origin main --rebase
             sleep 5
           done
           
-          echo "Failed to push after 5 attempts"
+          echo "❌ Failed to push after 5 attempts"
           exit 1
 
-      - name: Verify upload
-        run: |
-          echo "## Upload Verification" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Files uploaded to: \`${{ steps.archive.outputs.folder }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Download URL:" >> $GITHUB_STEP_SUMMARY
-          echo "https://github.com/${{ github.repository }}/tree/main/${{ steps.archive.outputs.folder }}" >> $GITHUB_STEP_SUMMARY
-          
-          # List files
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Files in this upload:" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          ls -lh ${{ steps.archive.outputs.folder }} >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Summary
+      - name: Generate summary
         if: always()
         run: |
-          SUCCESS_DL="${{ steps.download.outputs.success_count }}"
-          FAILED_DL="${{ steps.download.outputs.failed_count }}"
-          PROCESSED="${{ steps.archive.outputs.processed_count }}"
-          TOTAL_SIZE="${{ steps.archive.outputs.total_size }}"
-          FOLDER="${{ steps.archive.outputs.folder }}"
-          SPLIT_SIZE="${{ steps.validate.outputs.split_mb }}"
+          SUCCESS="${{ steps.download.outputs.success_count }}"
+          FAILED="${{ steps.download.outputs.failed_count }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
           
-          echo "## Upload Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Download Status | ✅ $SUCCESS_DL success / ❌ $FAILED_DL failed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Files Processed | $PROCESSED |" >> $GITHUB_STEP_SUMMARY
-          echo "| Total Size | ${TOTAL_SIZE:-N/A} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Chunk Size | $SPLIT_SIZE MB |" >> $GITHUB_STEP_SUMMARY
-          echo "| Output Folder | [${FOLDER}](https://github.com/${{ github.repository }}/tree/main/${FOLDER}) |" >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+## 📊 Download Summary
+
+| Item | Result |
+|------|--------|
+| **Status** | $( [ "$SUCCESS" -gt 0 ] && echo "✅ Partial Success" || echo "❌ Failed" ) |
+| **Successful Downloads** | $SUCCESS |
+| **Failed Downloads** | $FAILED |
+| **Upload Location** | [downloads/${TIMESTAMP}](https://github.com/${{ github.repository }}/tree/main/downloads/${TIMESTAMP}) |
+
+### 📁 Access your files:
+\`\`\`
+https://github.com/${{ github.repository }}/tree/main/downloads/${TIMESTAMP}
+\`\`\`
+
+### 🔧 Extract files:
+\`\`\`bash
+# If password protected
+unzip -P "your_password" file.zip
+
+# Without password  
+unzip file.zip
+\`\`\`
+
+---
+**AVASAM Downloader** - *Your download solution*
+EOF

@@ -61,12 +61,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        
+        with:
+          fetch-depth: 0
+          ref: main
+          
       - name: Clean old archives
         if: ${{ github.event.inputs.delete_old_archives == 'true' }}
         run: |
           echo "Cleaning old archives..."
           rm -rf downloads/* 2>/dev/null || true
+          git rm -rf downloads/ 2>/dev/null || true
           echo "Cleanup completed"
 
       - name: Parse and validate inputs
@@ -204,7 +208,6 @@ jobs:
           for file in *; do
             if [ -f "$file" ]; then
               PROCESSED=$((PROCESSED + 1))
-              SIZE=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file")
               echo "Processing: $file"
               
               if [ -n "$PASSWORD" ] && [ ${#PASSWORD} -gt 0 ]; then
@@ -230,38 +233,97 @@ jobs:
           rm -rf downloads/temp
           echo "Processed ${PROCESSED} files, total size: ${TOTAL_SIZE}"
 
+      - name: Create README for the folder
+        run: |
+          FOLDER="${{ steps.archive.outputs.folder }}"
+          cat > "$FOLDER/README.md" << EOF
+          # Files uploaded on $(date)
+          
+          ## Download Instructions
+          
+          ### To download a single file:
+          \`\`\`bash
+          wget https://github.com/${{ github.repository }}/raw/main/${FOLDER}/filename.7z
+          \`\`\`
+          
+          ### To extract:
+          \`\`\`bash
+          # Without password
+          7z x filename.7z
+          
+          # With password (if set)
+          7z x -p"your_password" filename.7z
+          
+          # For multi-part files
+          7z x filename.7z.001
+          \`\`\`
+          
+          ## Files in this upload:
+          EOF
+          
+          cd "$FOLDER"
+          for file in *.7z*; do
+            if [ -f "$file" ]; then
+              SIZE=$(du -h "$file" | cut -f1)
+              echo "- \`$file\` ($SIZE)" >> README.md
+            fi
+          done
+          cd ../..
+          
+          echo "README created in $FOLDER"
+
       - name: Configure Git
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit and push
+      - name: Commit and push with force
         run: |
-          FOLDER="${{ steps.archive.outputs.folder }}"
+          # Pull latest changes
+          git pull origin main --rebase || true
           
-          git add "${FOLDER}/"* 2>/dev/null || true
+          # Add all downloads
+          git add downloads/
           
+          # Check if there are changes
           if git diff --staged --quiet; then
             echo "No files to commit"
             exit 0
           fi
           
-          CHUNK_COUNT=$(git diff --staged --name-only | wc -l)
-          git commit -m "Upload: ${{ steps.archive.outputs.processed_count }} file(s) to ${FOLDER} (${CHUNK_COUNT} chunks)"
+          # Commit
+          FOLDER="${{ steps.archive.outputs.folder }}"
+          git commit -m "Upload files to ${FOLDER}"
           
-          MAX_RETRIES=5
-          for attempt in $(seq 1 $MAX_RETRIES); do
-            echo "Push attempt $attempt/$MAX_RETRIES..."
-            git pull --rebase origin main 2>/dev/null || true
+          # Push with multiple retries
+          for i in 1 2 3 4 5; do
+            echo "Push attempt $i..."
             if git push origin main; then
-              echo "Push successful"
+              echo "Push successful!"
               exit 0
             fi
-            sleep 10
+            git pull origin main --rebase
+            sleep 5
           done
           
-          echo "Push failed after $MAX_RETRIES attempts"
+          echo "Failed to push after 5 attempts"
           exit 1
+
+      - name: Verify upload
+        run: |
+          echo "## Upload Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Files uploaded to: \`${{ steps.archive.outputs.folder }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Download URL:" >> $GITHUB_STEP_SUMMARY
+          echo "https://github.com/${{ github.repository }}/tree/main/${{ steps.archive.outputs.folder }}" >> $GITHUB_STEP_SUMMARY
+          
+          # List files
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Files in this upload:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh ${{ steps.archive.outputs.folder }} >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Summary
         if: always()

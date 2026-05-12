@@ -1,0 +1,458 @@
+name: 📦 Advanced File Upload to GitHub
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_urls:
+        description: '📎 File URLs (one per line, max 10 URLs)'
+        required: true
+        type: string
+        default: ''
+      zip_password:
+        description: '🔐 Password for archive (optional)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: '📦 Maximum chunk size per file'
+        required: false
+        type: choice
+        default: '95'
+        options:
+          - '10'
+          - '25'
+          - '50'
+          - '95'
+      compression_level:
+        description: '🗜️ Compression level (0=none, 9=ultra)'
+        required: false
+        type: choice
+        default: '3'
+        options:
+          - '0'
+          - '1'
+          - '3'
+          - '5'
+          - '7'
+          - '9'
+      delete_old_archives:
+        description: '🗑️ Delete all existing archives before upload'
+        required: false
+        type: boolean
+        default: false
+      retry_count:
+        description: '🔄 Download retry attempts per file'
+        required: false
+        type: number
+        default: '3'
+      timeout_seconds:
+        description: '⏱️ Download timeout per file (seconds)'
+        required: false
+        type: number
+        default: '300'
+      custom_prefix:
+        description: '🏷️ Custom prefix for output files (default: sci-hub.ir)'
+        required: false
+        type: string
+        default: 'sci-hub.ir'
+      max_parallel_downloads:
+        description: '⚡ Parallel downloads (1-5)'
+        required: false
+        type: choice
+        default: '3'
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: file-upload-queue
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: 1
+
+jobs:
+  upload-files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: ⚡ Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            downloads
+          sparse-checkout-cone-mode: false
+
+      - name: 🧹 Clean old archives
+        if: ${{ github.event.inputs.delete_old_archives == 'true' }}
+        run: |
+          echo "🗑️ Cleaning old archives..."
+          find downloads -type f \( -name "*.7z*" -o -name "*.part*" \) -delete 2>/dev/null || true
+          find . -maxdepth 1 -type f \( -name "*.7z*" -o -name "*.log" \) -delete 2>/dev/null || true
+          echo "✅ Cleanup completed"
+
+      - name: 📝 Parse and validate inputs
+        id: parse
+        run: |
+          # Parse split size
+          SPLIT_MB="${{ github.event.inputs.split_size }}"
+          echo "split_mb=${SPLIT_MB}" >> $GITHUB_OUTPUT
+          
+          # Parse compression level
+          COMPRESS="${{ github.event.inputs.compression_level }}"
+          echo "compress=${COMPRESS}" >> $GITHUB_OUTPUT
+          
+          # Parse retry count
+          RETRY="${{ github.event.inputs.retry_count }}"
+          echo "retry=${RETRY:-3}" >> $GITHUB_OUTPUT
+          
+          # Parse timeout
+          TIMEOUT="${{ github.event.inputs.timeout_seconds }}"
+          echo "timeout=${TIMEOUT:-300}" >> $GITHUB_OUTPUT
+          
+          # Parse parallel downloads
+          PARALLEL="${{ github.event.inputs.max_parallel_downloads }}"
+          echo "parallel=${PARALLEL:-3}" >> $GITHUB_OUTPUT
+          
+          # Parse custom prefix
+          PREFIX="${{ github.event.inputs.custom_prefix }}"
+          if [ -z "$PREFIX" ]; then
+            PREFIX="sci-hub.ir"
+          fi
+          echo "prefix=${PREFIX}" >> $GITHUB_OUTPUT
+          
+          # Parse URLs (one per line, trim whitespace)
+          echo "${{ github.event.inputs.file_urls }}" | grep -v '^[[:space:]]*$' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > urls.txt
+          
+          # Validate URLs
+          total=$(wc -l < urls.txt)
+          if [ "$total" -eq 0 ]; then
+            echo "❌ Error: No valid URLs provided"
+            exit 1
+          fi
+          
+          if [ "$total" -gt 10 ]; then
+            echo "⚠️ Warning: More than 10 URLs provided, only first 10 will be processed"
+            head -10 urls.txt > urls_temp.txt
+            mv urls_temp.txt urls.txt
+            total=10
+          fi
+          
+          echo "url_count=${total}" >> $GITHUB_OUTPUT
+          echo "📊 URL count: ${total}"
+          echo "📋 URLs to process:"
+          cat -n urls.txt
+
+      - name: 🛠️ Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full curl wget aria2 jq pigz
+          echo "✅ Dependencies installed"
+
+      - name: 📥 Download files (parallel mode)
+        id: download
+        run: |
+          mkdir -p downloads/temp
+          cd downloads/temp
+          
+          PARALLEL="${{ steps.parse.outputs.parallel }}"
+          RETRY="${{ steps.parse.outputs.retry }}"
+          TIMEOUT="${{ steps.parse.outputs.timeout }}"
+          PREFIX="${{ steps.parse.outputs.prefix }}"
+          TOTAL_URLS="${{ steps.parse.outputs.url_count }}"
+          
+          # Create download script
+          cat > download.sh << 'SCRIPT'
+          #!/bin/bash
+          URL="$1"
+          COUNTER="$2"
+          TOTAL="$3"
+          PREFIX="$4"
+          
+          # Extract filename from URL
+          FILENAME=$(basename "$URL" | cut -d'?' -f1 | sed 's/[^a-zA-Z0-9._-]/_/g')
+          if [ -z "$FILENAME" ]; then
+            FILENAME="file_${COUNTER}"
+          fi
+          
+          # Generate output name
+          if [ "$TOTAL" -gt 1 ]; then
+            NUM=$(printf '%02d' $COUNTER)
+            OUTPUT_NAME="${PREFIX}_${NUM}_${FILENAME}"
+          else
+            OUTPUT_NAME="${PREFIX}_${FILENAME}"
+          fi
+          
+          # Limit filename length
+          if [ ${#OUTPUT_NAME} -gt 100 ]; then
+            EXT="${OUTPUT_NAME##*.}"
+            BASE="${OUTPUT_NAME%.*}"
+            BASE="${BASE:0:80}"
+            OUTPUT_NAME="${BASE}.${EXT}"
+          fi
+          
+          echo "📥 [$COUNTER/$TOTAL] Downloading: $OUTPUT_NAME"
+          
+          # Try multiple download methods
+          if curl -L --fail --retry $RETRY --retry-delay 5 --connect-timeout 30 \
+             --max-time $TIMEOUT --progress-bar -o "$OUTPUT_NAME" "$URL" 2>/dev/null; then
+            SIZE=$(du -h "$OUTPUT_NAME" | cut -f1)
+            echo "✅ Downloaded: $OUTPUT_NAME ($SIZE)"
+            echo "$OUTPUT_NAME" >> ../downloaded.txt
+            return 0
+          elif wget --tries=$RETRY --timeout=$TIMEOUT -q --show-progress -O "$OUTPUT_NAME" "$URL" 2>/dev/null; then
+            SIZE=$(du -h "$OUTPUT_NAME" | cut -f1)
+            echo "✅ Downloaded: $OUTPUT_NAME ($SIZE)"
+            echo "$OUTPUT_NAME" >> ../downloaded.txt
+            return 0
+          else
+            echo "❌ Failed: $URL"
+            return 1
+          fi
+          SCRIPT
+          
+          chmod +x download.sh
+          
+          # Process downloads in parallel
+          COUNTER=1
+          SUCCESS=0
+          FAILED=0
+          
+          while IFS= read -r url; do
+            if [ -n "$url" ]; then
+              export -f download
+              timeout 600 bash download.sh "$url" "$COUNTER" "$TOTAL_URLS" "$PREFIX" &
+              
+              # Control parallel jobs
+              while [ $(jobs -r | wc -l) -ge $PARALLEL ]; do
+                sleep 1
+              done
+              
+              COUNTER=$((COUNTER + 1))
+            fi
+          done < ../../urls.txt
+          
+          # Wait for all downloads to complete
+          wait
+          
+          # Count results
+          if [ -f downloaded.txt ]; then
+            SUCCESS=$(wc -l < downloaded.txt)
+          fi
+          
+          FAILED=$((COUNTER - 1 - SUCCESS))
+          echo "success_count=${SUCCESS}" >> $GITHUB_OUTPUT
+          echo "failed_count=${FAILED}" >> $GITHUB_OUTPUT
+          echo "📊 Download stats: Success: $SUCCESS, Failed: $FAILED"
+
+      - name: 🗜️ Archive and split files
+        id: archive
+        run: |
+          SPLIT_MB="${{ steps.parse.outputs.split_mb }}"
+          COMPRESS="${{ steps.parse.outputs.compress }}"
+          PASSWORD="${{ github.event.inputs.zip_password }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          FOLDER="downloads/${TIMESTAMP}"
+          mkdir -p "$FOLDER"
+          
+          echo "📁 Output folder: ${FOLDER}"
+          echo "📦 Split size: ${SPLIT_MB}MB"
+          echo "🗜️ Compression level: ${COMPRESS}"
+          
+          PROCESSED=0
+          TOTAL_SIZE=0
+          
+          cd downloads/temp
+          
+          for file in *; do
+            [ -f "$file" ] || continue
+            PROCESSED=$((PROCESSED + 1))
+            SIZE=$(stat -c%s "$file")
+            TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+            
+            echo "🔄 Processing: $file ($(numfmt --to=iec $SIZE))"
+            
+            # Build 7z command
+            7Z_CMD="7z a"
+            
+            if [ -n "$PASSWORD" ] && [ ${#PASSWORD} -gt 0 ]; then
+              7Z_CMD="$7Z_CMD -p\"$PASSWORD\" -mhe=on"
+            fi
+            
+            7Z_CMD="$7Z_CMD -mx=${COMPRESS} -mmt=on"
+            
+            # Split if file is larger than split size OR multiple files
+            FILE_SIZE_MB=$((SIZE / 1024 / 1024))
+            if [ $FILE_SIZE_MB -gt $SPLIT_MB ] || [ $PROCESSED -gt 1 ]; then
+              7Z_CMD="$7Z_CMD -v${SPLIT_MB}m"
+            fi
+            
+            7Z_CMD="$7Z_CMD \"../${FOLDER}/${file}.7z\" \"$file\""
+            
+            eval $7Z_CMD > /dev/null 2>&1
+            
+            # Check if split created multiple files
+            if [ -f "../${FOLDER}/${file}.7z.001" ]; then
+              # Check if only one chunk exists
+              if [ ! -f "../${FOLDER}/${file}.7z.002" ]; then
+                mv "../${FOLDER}/${file}.7z.001" "../${FOLDER}/${file}.7z"
+                echo "  ✅ Single file archive"
+              else
+                echo "  ✅ Split into multiple chunks"
+              fi
+            else
+              echo "  ✅ Archived successfully"
+            fi
+          done
+          
+          cd ../..
+          
+          # Calculate total size
+          TOTAL_SIZE_HR=$(du -sh "$FOLDER" | cut -f1)
+          echo "processed_count=${PROCESSED}" >> $GITHUB_OUTPUT
+          echo "folder=${FOLDER}" >> $GITHUB_OUTPUT
+          echo "total_size=${TOTAL_SIZE_HR}" >> $GITHUB_OUTPUT
+          
+          # Cleanup temp files
+          rm -rf downloads/temp
+          
+          echo "📊 Processed ${PROCESSED} files, total size: ${TOTAL_SIZE_HR}"
+
+      - name: 📊 Generate file manifest
+        id: manifest
+        run: |
+          FOLDER="${{ steps.archive.outputs.folder }}"
+          MANIFEST="${FOLDER}/manifest.txt"
+          
+          echo "=========================================" > "$MANIFEST"
+          echo "File Upload Manifest" >> "$MANIFEST"
+          echo "Date: $(date)" >> "$MANIFEST"
+          echo "Repository: ${{ github.repository }}" >> "$MANIFEST"
+          echo "=========================================" >> "$MANIFEST"
+          echo "" >> "$MANIFEST"
+          
+          if [ -n "${{ github.event.inputs.zip_password }}" ]; then
+            echo "🔐 Archive Password: ${{ github.event.inputs.zip_password }}" >> "$MANIFEST"
+            echo "" >> "$MANIFEST"
+          fi
+          
+          echo "📦 Files uploaded:" >> "$MANIFEST"
+          echo "" >> "$MANIFEST"
+          
+          cd "$FOLDER"
+          for file in *.7z*; do
+            if [ -f "$file" ]; then
+              SIZE=$(du -h "$file" | cut -f1)
+              echo "- $file ($SIZE)" >> manifest.txt
+            fi
+          done
+          cd ../..
+          
+          echo "✅ Manifest created: $MANIFEST"
+          
+          # Add manifest to git
+          git add "$MANIFEST" 2>/dev/null || true
+
+      - name: 🔧 Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+      - name: 🚀 Commit and push with retry
+        run: |
+          FOLDER="${{ steps.archive.outputs.folder }}"
+          
+          # Add all new files
+          git add "${FOLDER}/"* 2>/dev/null || true
+          
+          if git diff --staged --quiet; then
+            echo "ℹ️ No changes to commit"
+            exit 0
+          fi
+          
+          CHUNK_COUNT=$(git diff --staged --name-only | wc -l)
+          git commit -m "📦 Upload: ${{ steps.archive.outputs.processed_count }} file(s) to ${FOLDER} (${CHUNK_COUNT} chunks)"
+          
+          # Push with retry logic
+          MAX_RETRIES=10
+          RETRY_DELAY=15
+          
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "🔄 Push attempt $attempt/$MAX_RETRIES..."
+            
+            # Pull with rebase to avoid conflicts
+            git pull --rebase origin main 2>/dev/null || true
+            
+            if git push origin main; then
+              echo "✅ Push successful!"
+              exit 0
+            else
+              if [ $attempt -lt $MAX_RETRIES ]; then
+                echo "⚠️ Push failed, retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+                RETRY_DELAY=$((RETRY_DELAY * 2))
+              fi
+            fi
+          done
+          
+          echo "❌ Push failed after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: ✅ Generate summary report
+        if: always()
+        run: |
+          SUCCESS_DL="${{ steps.download.outputs.success_count }}"
+          FAILED_DL="${{ steps.download.outputs.failed_count }}"
+          PROCESSED="${{ steps.archive.outputs.processed_count }}"
+          TOTAL_SIZE="${{ steps.archive.outputs.total_size }}"
+          FOLDER="${{ steps.archive.outputs.folder }}"
+          SPLIT_SIZE="${{ steps.parse.outputs.split_mb }}"
+          COMPRESS="${{ steps.parse.outputs.compress }}"
+          PASSWORD_SET="${{ github.event.inputs.zip_password != '' }}"
+          
+          # Determine overall status
+          if [ "$SUCCESS_DL" -gt 0 ] && [ "$FAILED_DL" -eq 0 ] && [ "$PROCESSED" -gt 0 ]; then
+            STATUS="✅ **SUCCESS**"
+            COLOR="success"
+          elif [ "$SUCCESS_DL" -gt 0 ]; then
+            STATUS="⚠️ **PARTIAL** (some downloads failed)"
+            COLOR="warning"
+          else
+            STATUS="❌ **FAILED**"
+            COLOR="failure"
+          fi
+          
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          <div dir="rtl" align="right">
+          
+          ## 📦 گزارش آپلود فایل
+          
+          | مورد | مقدار |
+          |------|-------|
+          | وضعیت | STATUS_PLACEHOLDER |
+          | دانلود موفق | SUCCESS_DL_PLACEHOLDER / TOTAL_PLACEHOLDER |
+          | فایل پردازش شده | PROCESSED_PLACEHOLDER عدد |
+          | حجم کل فایل‌ها | TOTAL_SIZE_PLACEHOLDER |
+          | حجم هر تکه | SPLIT_SIZE_PLACEHOLDER مگابایت |
+          | سطح فشرده‌سازی | COMPRESS_PLACEHOLDER/9 |
+          | رمزگذاری | PASSWORD_PLACEHOLDER |
+          | پوشه خروجی | [FOLDER_PLACEHOLDER](https://github.com/${{ github.repository }}/tree/main/FOLDER_PLACEHOLDER) |
+          
+          </div>
+          
+          <details>
+          <summary><b>📖 راهنمای دانلود و استخراج</b></summary>
+          
+          ### برای دانلود تک فایل:
+          ```bash
+          wget https://github.com/${{ github.repository }}/raw/main/FOLDER_PLACEHOLDER/filename.7z

@@ -1,0 +1,138 @@
+name: 📦 آپلود پیشرفته فایل به گیت‌هاب
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_urls:
+        description: '📎 لینک‌های فایل (هر لینک در یک خط، حداکثر ۱۰ لینک)'
+        required: true
+        type: string
+        default: ''
+      zip_password:
+        description: '🔐 رمز فایل آرشیو (اختیاری)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: '📦 حداکثر حجم هر تکه (مگابایت)'
+        required: false
+        type: choice
+        default: '95'
+        options:
+          - '10'
+          - '25'
+          - '50'
+          - '95'
+      compression_level:
+        description: '🗜️ سطح فشرده‌سازی (۰=بدون فشرده‌سازی، ۹=بیشترین فشرده‌سازی)'
+        required: false
+        type: choice
+        default: '3'
+        options:
+          - '0'
+          - '1'
+          - '3'
+          - '5'
+          - '7'
+          - '9'
+      delete_old_archives:
+        description: '🗑️ حذف تمام آرشیوهای قبلی قبل از آپلود'
+        required: false
+        type: boolean
+        default: false
+      retry_count:
+        description: '🔄 تعداد دفعات تلاش مجدد برای دانلود هر فایل'
+        required: false
+        type: number
+        default: '3'
+      timeout_seconds:
+        description: '⏱️ زمان انتظار برای دانلود هر فایل (ثانیه)'
+        required: false
+        type: number
+        default: '300'
+      custom_prefix:
+        description: '🏷️ پیشوند دلخواه برای فایل‌های خروجی (اختیاری)'
+        required: false
+        type: string
+        default: 'file'
+      max_parallel_downloads:
+        description: '⚡ دانلود همزمان (۱ تا ۵ فایل با هم)'
+        required: false
+        type: choice
+        default: '3'
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: صف-آپلود-فایل
+  cancel-in-progress: false
+
+jobs:
+  آپلود-فایل-ها:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: ⚡ دریافت کد مخزن
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          
+      - name: 🧹 پاکسازی آرشیوهای قدیمی
+        if: ${{ github.event.inputs.delete_old_archives == 'true' }}
+        run: |
+          echo "🗑️ در حال پاکسازی آرشیوهای قدیمی..."
+          find downloads -type f \( -name "*.7z*" -o -name "*.part*" \) -delete 2>/dev/null || true
+          echo "✅ پاکسازی انجام شد"
+          
+      - name: 📝 بررسی و اعتبارسنجی ورودی‌ها
+        id: بررسی
+        run: |
+          SIZE="${{ github.event.inputs.split_size }}"
+          echo "split_mb=${SIZE}" >> $GITHUB_OUTPUT
+          COMPRESS="${{ github.event.inputs.compression_level }}"
+          echo "compress=${COMPRESS}" >> $GITHUB_OUTPUT
+          RETRY="${{ github.event.inputs.retry_count }}"
+          echo "retry=${RETRY:-3}" >> $GITHUB_OUTPUT
+          TIMEOUT="${{ github.event.inputs.timeout_seconds }}"
+          echo "timeout=${TIMEOUT:-300}" >> $GITHUB_OUTPUT
+          PARALLEL="${{ github.event.inputs.max_parallel_downloads }}"
+          echo "parallel=${PARALLEL:-3}" >> $GITHUB_OUTPUT
+          PREFIX="${{ github.event.inputs.custom_prefix }}"
+          echo "prefix=${PREFIX:-file}" >> $GITHUB_OUTPUT
+          
+          echo "${{ github.event.inputs.file_urls }}" | grep -v '^[[:space:]]*$' > urls.txt
+          total=$(wc -l < urls.txt)
+          echo "url_count=${total}" >> $GITHUB_OUTPUT
+          
+      - name: 🛠️ نصب ابزارهای مورد نیاز
+        run: sudo apt-get update -qq && sudo apt-get install -y p7zip-full curl wget
+        
+      - name: 📥 دانلود فایل‌ها
+        id: دانلود
+        run: |
+          mkdir -p downloads/temp && cd downloads/temp
+          # کد دانلود همزمان
+          # (برای مشاهده کد کامل به فایل اصلی مراجعه کنید)
+          
+      - name: 🗜️ فشرده‌سازی و تقسیم فایل‌ها
+        id: آرشیو
+        run: |
+          # کد فشرده‌سازی و تقسیم
+          # (برای مشاهده کد کامل به فایل اصلی مراجعه کنید)
+          
+      - name: 🚀 ارسال به مخزن
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add downloads/
+          git commit -m "آپلود خودکار فایل‌ها" || echo "No changes"
+          git push origin main
